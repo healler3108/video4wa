@@ -1,0 +1,183 @@
+#!/bin/zsh
+
+f_input=$@[2]
+
+target_size=$@[1]
+echo "Target file size is $target_size mb"
+
+target_size=$(echo "scale=7;$target_size*0.9536743" | bc)
+
+duration=$(ffprobe \
+    -i $f_input \
+    -loglevel quiet \
+    -print_format compact=print_section=0:nokey=1 \
+    -show_entries format=duration \
+)
+
+duration=$(echo "($duration+0.5)/1" | bc)
+
+v_settings=$(ffprobe \
+    -i $f_input \
+    -loglevel quiet \
+    -print_format compact=print_section=0:nokey=1 \
+    -select_streams v:0 \
+    -show_entries stream=width,height,r_frame_rate \
+)
+
+v_settings=(${(s:|:)v_settings})
+
+v_width=$v_settings[1]
+v_height=$v_settings[2]
+v_fps=$(echo "scale=3;$v_settings[3]" | bc)
+
+a_settings=$(ffprobe \
+    -i $f_input \
+    -loglevel quiet \
+    -print_format compact=print_section=0:nokey=1 \
+    -select_streams a:0 \
+    -show_entries stream=codec_name,bit_rate,sample_rate,channels \
+)
+
+a_settings=(${(s:|:)a_settings})
+
+a_codec=$a_settings[1]
+a_br=$a_settings[4]
+a_br=$(echo "scale=3;$a_br/1000" | bc)
+a_br=$(echo "($a_br+0.5)/1" | bc)
+a_rate=$a_settings[2]
+a_channels=$a_settings[3]
+
+target_br=$(echo "scale=3;(($target_size*8192)/$duration)-$a_br" | bc)
+target_br=$(echo "($target_br+0.5)/1" | bc)
+
+ffparams=(
+    -y
+    -hwaccel videotoolbox
+    -i $f_input
+    -hide_banner
+    -loglevel error
+    -stats
+    -map_metadata -1
+    -map_chapters -1
+    -pix_fmt yuv420p
+)
+
+width=$v_width
+height=$v_height
+fps=$v_fps
+
+if [[ $target_br -lt 96 ]]; then
+    echo "Cant't reach target file size for this video! :("
+    exit 1
+elif [[ $target_br -lt 300 && $v_width -ge 640 ]]; then
+    width=426
+    height=240
+    [[ $v_fps -ge 24 ]] && fps=23.976
+    if [[ $a_br -ge 128 ]]; then
+        new_a_br=96
+        delta=$(( $a_br - $new_a_br ))
+        target_br=$(( $target_br + $delta ))
+        a_br=$new_a_br
+    fi
+elif [[ $target_br -lt 500 && $v_width -ge 854 ]]; then
+    width=640
+    height=360
+    [[ $v_fps -ge 25 ]] && fps=24
+elif [[ $target_br -lt 1000 && $v_width -ge 1280 ]]; then
+    width=854
+    height=480
+    [[ $v_fps -gt 25 ]] && fps=25
+elif [[ $target_br -lt 1500 && $v_width -ge 1920 ]]; then
+    width=1280
+    height=720
+    [[ $v_fps -gt 30 ]] && fps=30
+elif [[ $target_br -lt 2000 && $v_width -gt 1920 && $v_fps -ge 60 ]]; then
+    fps=30
+fi
+
+if [[ $width -ne $v_width ]]; then
+    if [[ $fps -ne $v_fps ]]; then
+        ffparams+=(
+            -vf scale=$width:$height:force_original_aspect_ratio=decrease:force_divisible_by=2,fps=fps=$fps
+        )
+    else
+        ffparams+=(
+            -vf scale=$width:$height:force_original_aspect_ratio=decrease:force_divisible_by=2
+        )
+    fi   
+else
+    if [[ $fps -ne $v_fps ]]; then
+        ffparams+=(
+            -vf fps=fps=$fps
+        )
+    fi
+fi
+
+echo "Target video bitrate is $target_br kbps"
+
+echo "Target video dimensions is ${width}x${height} px"
+
+echo "Target framerate is $fps fps"
+
+ffparams1p=(${ffparams[@]})
+ffparams2p=(${ffparams[@]})
+
+if [[ $a_br -gt 128 ]]; then
+    a_br=128
+    ffparams2p+=(
+        -c:a aac
+        -b:a ${a_br}k
+    )
+elif [[ $a_br -le 128 ]]; then
+    if [[ $a_codec -ne "aac" ]]; then
+        ffparams2p+=(
+            -c:a aac
+            -b:a ${a_br}k
+        )
+    else
+        ffparams2p+=(
+            -c:a copy
+        )
+    fi
+else
+    ffparams+=(
+        -c:a aac
+        -b:a ${a_br}k
+    )
+fi
+
+echo "Target audio bitrate is $a_br kbps"
+
+[[ $a_rate -gt 44100 ]] && ffparams2p+=(-ar 44100)
+
+[[ $a_channels -gt 2 ]] && ffparams2p+=(-ac 2)
+
+f_output=$(cat /dev/random | LC_CTYPE=C tr -cd '[:alnum:][=-=][=_=]' | head -c $(jot -r 1 8 24)).mp4
+
+ffparams1p+=(
+    -an
+    -c:v libx264
+    -b:v ${target_br}k
+    -pass 1
+    -f null
+    /dev/null
+)
+
+ffparams2p+=(
+    -c:v libx264
+    -b:v ${target_br}k
+    -pass 2
+    -preset slow
+    -f mp4
+    $f_output
+)
+
+echo "Output will be writen to $f_output"
+
+echo "Processing 1 pass:"
+ffmpeg ${ffparams1p[@]}
+
+echo "Processing 2 pass:"
+ffmpeg ${ffparams2p[@]}
+
+[[ -f ffmpeg2pass-0.log  ]] && rm -f ffmpeg2pass*
