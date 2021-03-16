@@ -64,6 +64,7 @@ ffparams=(
 
 width=$v_width
 height=$v_height
+
 fps=$v_fps
 
 if [[ $target_br -lt 96 ]]; then
